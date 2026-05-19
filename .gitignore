@@ -1,0 +1,22 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# macOS
+.DS_Store
+
+# Local output and temporary media artifacts
+output/
+merge_output/
+*.mp4
+*.ts
+*.key
+concat_list.txt
+*.log

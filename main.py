@@ -1,0 +1,337 @@
+import re
+import shutil
+import subprocess
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+
+from mp4_validator import get_validator
+from ts_analyzer import TSAnalyzer
+
+# ===== 配置 =====
+BASE_DIR = Path("/Users/jiangliqun/Downloads/output/3")
+OUTPUT_DIR = Path("/Users/jiangliqun/Downloads/output/merge_output")
+MAX_WORKERS = 4
+DISK_THRESHOLD_GB = 1.0  # 剩余空间阈值 (GB)
+CHECK_INTERVAL = 2.0  # 磁盘检测间隔 (秒)
+DISK_SAFE_SPACE_GB = 3.0  # 磁盘剩余安全容量 (GB)
+
+# 全局停止信号
+STOP_EVENT = threading.Event()
+SOFT_STOP_FLAG = threading.Event()
+
+
+def is_disk_space_sufficient(min_gb: float) -> bool:
+
+    try:
+        # 写死获取根目录的磁盘情况
+        free_gb = getFreeGB()
+        return free_gb >= min_gb
+    except Exception:  # 其他意外错误
+        return False
+
+
+def getFreeGB():
+    usage = shutil.disk_usage(str(OUTPUT_DIR))
+    free_gb = usage.free / (1024**3)
+    return round(free_gb, 1)
+
+
+def disk_monitor():
+    """后台监控守护线程：检查全盘剩余空间"""
+    print(f"🔍 磁盘全局监控已启动 (阈值: {DISK_THRESHOLD_GB}GB)")
+
+    while not STOP_EVENT.is_set():
+        # 软限制检查 (3GB)
+        if not is_disk_space_sufficient(DISK_SAFE_SPACE_GB):
+            if not SOFT_STOP_FLAG.is_set():
+                print(
+                    f"\n⚠️ 提示：磁盘空间低于 {DISK_SAFE_SPACE_GB}GB，将不再启动新任务。"
+                )
+                SOFT_STOP_FLAG.set()
+        else:
+            SOFT_STOP_FLAG.clear()
+
+        # 硬限制检查 (1GB)
+        if not is_disk_space_sufficient(DISK_THRESHOLD_GB):
+            # 获取当前精确数值用于打印提示
+            print("\n🚨 紧急刹车：磁盘全局剩余空间不足")
+            STOP_EVENT.set()
+            break
+
+        # 每隔指定时间检查一次
+        time.sleep(CHECK_INTERVAL)
+
+
+def natural_sort_key(s):
+    return [
+        int(text) if text.isdigit() else text.lower()
+        for text in re.split(r"(\d+)", str(s))
+    ]
+
+
+def get_clean_name(folder_name: str):
+    # 1. 先把 .m3u8 及其后面的所有杂质切掉 (忽略大小写)
+    # 比如 "video.m3u8_cache" -> "video"
+    temp_name = re.sub(r"\.m3u8.*", "", folder_name, flags=re.IGNORECASE)
+
+    # 2. 只保留字母和数字
+    clean_name = re.sub(r"[^a-zA-Z0-9]", "", temp_name)
+
+    # 3. 返回清洗后的结果，如果洗干了就返回 "output" 兜底
+    return clean_name if clean_name else "output"
+
+
+def find_best_ts_dir(folder: Path) -> Path:
+    # 找出所有包含 .ts 的目录（递归）
+    dirs_with_ts = [
+        d
+        for d in [folder] + list(folder.rglob("*"))
+        if d.is_dir() and any(d.glob("*.ts"))
+    ]
+
+    if not dirs_with_ts:
+        return folder
+
+    # 按直接包含的 .ts 数量排序
+    return max(dirs_with_ts, key=lambda d: len(list(d.glob("*.ts"))))
+
+
+def get_dir_size_gb(folder: Path) -> float:
+    """计算文件夹内所有 .ts 文件的体积总和 (GB)"""
+    try:
+        total_bytes = sum(f.stat().st_size for f in folder.glob("*.ts") if f.is_file())
+        return total_bytes / (1024**3)
+    except Exception:
+        return 0.0
+
+
+def process_folder(folder: Path):
+    # 合并前、运行中、合并后都通过 STOP_EVENT 判断
+    # 1. 基础状态检查
+    if STOP_EVENT.is_set():
+        return ("skip", folder.name, "紧急停止")
+    if SOFT_STOP_FLAG.is_set():
+        return ("skip", folder.name, "触发软停止限制（空间不足）")
+
+    folder_name = folder.name
+    list_file = None
+    output_file = None
+
+    try:
+        # 1. 扫描 TS 文件
+        ts_dir = find_best_ts_dir(folder)
+        ts_files = sorted(
+            list(ts_dir.glob("*.ts")), key=lambda x: natural_sort_key(x.name)
+        )
+
+        if not ts_files:
+            return ("warn", folder_name, "找不到 TS 文件")
+
+        # 2. 基础信息生成
+        output_name = f"{get_clean_name(folder_name)}.mp4"
+        output_file = OUTPUT_DIR / output_name
+        error_log = OUTPUT_DIR / f"{get_clean_name(folder_name)}.txt"
+
+        print(f"{output_name} 扫描完毕，准备校验")
+        # 检查ts是否合格。tag是一个标签，区分ts合成的种类，如果不合格，会抛出异常，这个任务算失败了。
+        tag = TSAnalyzer.analyze(ts_files)
+        output_name = f"{get_clean_name(folder_name)}_{tag}.mp4"
+        output_file = OUTPUT_DIR / output_name
+        error_log = OUTPUT_DIR / f"{get_clean_name(folder_name)}_{tag}.txt"
+
+        print(f"{output_name} 校验合格，准备合并")
+
+        # 3. 跳过本地已有的
+        if output_file.exists():
+            is_ok, _ = get_validator().verify(output_file)
+            if is_ok:
+                return ("skip", folder_name, f"已存在且完整 ({output_name})")
+            else:
+                output_file.unlink()
+
+        # 二次检查停止信号
+        if STOP_EVENT.is_set():
+            return ("skip", folder_name, "任务已取消")
+
+        # 计算真实需要的空间大小，看看磁盘剩余是否符合
+        ts_total_size = get_dir_size_gb(ts_dir)
+        if not is_disk_space_sufficient(ts_total_size * 1.2):
+            # 这里不设置硬退出，因为可能是某个文件特别大，让其他小文件试试。
+            return (
+                "fail",
+                folder_name,
+                "预估空间不足",
+            )
+
+        # 4. 生成 ffmpeg 列表文件
+        list_file = ts_dir / "concat_list.txt"
+        with open(list_file, "w", encoding="utf-8") as f:
+            for ts in ts_files:
+                safe_name = ts.name.replace("'", "'\\''")
+                f.write(f"file '{safe_name}'\n")
+
+        # 执行 FFmpeg 合并
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-loglevel",
+            "error",  # 只输出错误，减少日志体积
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(list_file),
+            "-c",
+            "copy",
+            str(output_file),
+        ]
+        print(f"{output_name} 开始合并")
+        result = subprocess.run(
+            cmd,
+            cwd=ts_dir,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if result.stderr and len(result.stderr) > 10000:
+            result_stderr = result.stderr[:10000] + "\n...truncated..."
+        else:
+            result_stderr = result.stderr
+        if result.returncode == 0:
+            if error_log.exists():
+                error_log.unlink(missing_ok=True)
+            return ("success", folder_name, output_name)
+        else:
+            # 失败处理：清理半成品
+            if output_file.exists():
+                output_file.unlink()
+            # FFmpeg层级的报错，空间不足
+            if "No space left on device" in result.stderr:
+                STOP_EVENT.set()
+                return ("fail", folder_name, "❌ 磁盘爆满")
+            with open(error_log, "w") as f:
+                f.write(result_stderr)
+            return ("fail", folder_name, "FFmpeg 报错")
+
+    except Exception as e:
+        if isinstance(e, OSError) and e.errno == 28:  # 磁盘空间不足的系统错误码
+            STOP_EVENT.set()
+            return ("fail", folder_name, "❌ 磁盘空间已满 (写入清单失败)")
+        if output_file is not None and output_file.exists():
+            output_file.unlink()
+
+        return ("fail", folder_name, f"异常: {e}")
+    finally:
+        if list_file and list_file.exists():
+            list_file.unlink(missing_ok=True)
+
+        checkDiskSpace()
+
+
+def checkDiskSpace():
+    if not is_disk_space_sufficient(DISK_SAFE_SPACE_GB):
+        SOFT_STOP_FLAG.set()
+    else:
+        SOFT_STOP_FLAG.clear()
+
+
+def main():
+
+    if not OUTPUT_DIR.exists():
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    print(f"~~~~~ 🎉 还能下{getFreeGB()}个G的 ~~~~~")
+    # 它会检查文件夹名里是否包含 "index" 或者 "m3u8"。
+    # 只要命中其中一个关键词，这个文件夹就会被加入到 target_folders 列表中。
+    target_folders = [
+        p
+        for p in BASE_DIR.iterdir()
+        if p.is_dir() and any(k in p.name.lower() for k in ["index", "m3u8"])
+    ]
+    print(f"🎬 发现任务: {len(target_folders)} 个\n")
+
+    if len(target_folders) <= 0:
+        print("👋🏻 👋🏻  没有可执行的任务，程序退出")
+        return
+
+    # if len(target_folders) >= 0:
+    #     print("👋🏻 👋🏻  没有可执行的任务，程序退出")
+    #     return
+
+    # 启动监控
+    monitor_thread = threading.Thread(target=disk_monitor, daemon=True)
+    monitor_thread.start()
+
+    results = []
+    # 使用 ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        # 提交所有任务，注意仅仅是提交到等待队列，process_folder不会执行。
+        future_to_folder = {
+            executor.submit(process_folder, folder): folder for folder in target_folders
+        }
+
+        try:
+            # 关键：使用 as_completed 实时获取结果
+            for future in as_completed(future_to_folder):
+                res = future.result()
+                results.append(res)
+                # 可以在这里根据 res 的内容做实时反馈，比如打印一行简报
+                status, name, info = res
+                tag = (
+                    "✅ 成功"
+                    if status == "success"
+                    else "⏩ 跳过"
+                    if status == "skip"
+                    else "❌ 失败"
+                )
+                print(f"{tag}  name: {name}  info: {info}")
+
+        except KeyboardInterrupt:
+            print("\n🛑 用户手动停止，正在等待当前线程收尾...")
+            STOP_EVENT.set()
+
+    # 计算各项数据
+    total_count = len(target_folders)
+    processed_count = len(results)
+    success = [r for r in results if r[0] == "success"]
+    failed = [r for r in results if r[0] == "fail"]
+    skipped = [r for r in results if r[0] == "skip"]
+
+    # 核心逻辑：总数 - 已产出结果的数量 = 没来得及执行的数量
+    cancelled_count = total_count - processed_count
+
+    print("\n" + "═" * 50)
+    print(f"📊 任务汇总报告 | 进度: {(processed_count / total_count) * 100:.1f}%")
+    print(f"  ● 总计任务: {total_count:>3} 个")
+    print("  ──────────────────────────────")
+
+    # 成功
+    if success:
+        print(f"  ✅ 成功完成: {len(success):>3} 个")
+        for _, name, info in success:
+            print(f"     - {name} -> {info}")
+
+    # 跳过
+    if skipped:
+        print(f"  ⏩ 自动跳过: {len(skipped):>3} 个")
+        for _, name, info in skipped:
+            print(f"     - {name}: {info}")
+
+    # 失败
+    if failed:
+        print(f"  ❌ 执行失败: {len(failed):>3} 个")
+        for _, name, info in failed:
+            print(f"     - {name}: {info}")
+
+    # 取消
+    if cancelled_count > 0:
+        print(f"  🚫 已取消: {cancelled_count:>3} 个\n")
+
+    print(f"~~~~~ 🎉 还能下{getFreeGB()}个G的 ~~~~~")
+    print("═" * 50)
+
+
+if __name__ == "__main__":
+    main()
