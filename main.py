@@ -98,6 +98,48 @@ def find_best_ts_dir(folder: Path) -> Path:
     return max(dirs_with_ts, key=lambda d: len(list(d.glob("*.ts"))))
 
 
+def has_merge_inputs(folder: Path) -> bool:
+    return any(folder.glob("*.m3u8")) or any(folder.rglob("*.ts"))
+
+
+def find_target_folders() -> list[Path]:
+    """Find first-level task folders that look like downloaded M3U8 jobs."""
+    return [
+        p
+        for p in BASE_DIR.iterdir()
+        if p.is_dir()
+        and (any(k in p.name.lower() for k in ["index", "m3u8"]) or has_merge_inputs(p))
+    ]
+
+
+def read_text_safely(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return path.read_text(encoding="utf-8-sig", errors="ignore")
+
+
+def is_encrypted_m3u8(path: Path) -> bool:
+    text = read_text_safely(path)
+    return "#EXT-X-KEY" in text and "METHOD=AES-128" in text.upper()
+
+
+def find_encrypted_m3u8(folder: Path, ts_dir: Path) -> Path | None:
+    candidates = []
+    candidates.extend(folder.glob("*.m3u8"))
+    candidates.extend(ts_dir.glob("*.m3u8"))
+    candidates.extend(folder.rglob("*.m3u8"))
+
+    seen = set()
+    for playlist in candidates:
+        if playlist in seen:
+            continue
+        seen.add(playlist)
+        if is_encrypted_m3u8(playlist):
+            return playlist
+    return None
+
+
 def get_dir_size_gb(folder: Path) -> float:
     """计算文件夹内所有 .ts 文件的体积总和 (GB)"""
     try:
@@ -105,6 +147,72 @@ def get_dir_size_gb(folder: Path) -> float:
         return total_bytes / (1024**3)
     except Exception:
         return 0.0
+
+
+def get_ffmpeg_stderr(stderr: str) -> str:
+    if stderr and len(stderr) > 10000:
+        return stderr[:10000] + "\n...truncated..."
+    return stderr
+
+
+def merge_plain_ts(ts_dir: Path, ts_files: list[Path], output_file: Path) -> subprocess.CompletedProcess:
+    list_file = ts_dir / "concat_list.txt"
+    try:
+        with open(list_file, "w", encoding="utf-8") as f:
+            for ts in ts_files:
+                safe_name = ts.name.replace("'", "'\\''")
+                f.write(f"file '{safe_name}'\n")
+
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(list_file),
+            "-c",
+            "copy",
+            str(output_file),
+        ]
+        return subprocess.run(
+            cmd,
+            cwd=ts_dir,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    finally:
+        if list_file.exists():
+            list_file.unlink(missing_ok=True)
+
+
+def merge_encrypted_m3u8(playlist: Path, output_file: Path) -> subprocess.CompletedProcess:
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-loglevel",
+        "error",
+        "-allowed_extensions",
+        "ALL",
+        "-protocol_whitelist",
+        "file,crypto,data",
+        "-i",
+        str(playlist),
+        "-c",
+        "copy",
+        str(output_file),
+    ]
+    return subprocess.run(
+        cmd,
+        cwd=playlist.parent,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
 
 
 def process_folder(folder: Path):
@@ -116,7 +224,6 @@ def process_folder(folder: Path):
         return ("skip", folder.name, "触发软停止限制（空间不足）")
 
     folder_name = folder.name
-    list_file = None
     output_file = None
 
     try:
@@ -137,6 +244,9 @@ def process_folder(folder: Path):
         print(f"{output_name} 扫描完毕，准备校验")
         # 检查ts是否合格。tag是一个标签，区分ts合成的种类，如果不合格，会抛出异常，这个任务算失败了。
         tag = TSAnalyzer.analyze(ts_files)
+        encrypted_m3u8 = find_encrypted_m3u8(folder, ts_dir)
+        if encrypted_m3u8:
+            tag = f"{tag}_aes"
         output_name = f"{get_clean_name(folder_name)}_{tag}.mp4"
         output_file = OUTPUT_DIR / output_name
         error_log = OUTPUT_DIR / f"{get_clean_name(folder_name)}_{tag}.txt"
@@ -165,41 +275,14 @@ def process_folder(folder: Path):
                 "预估空间不足",
             )
 
-        # 4. 生成 ffmpeg 列表文件
-        list_file = ts_dir / "concat_list.txt"
-        with open(list_file, "w", encoding="utf-8") as f:
-            for ts in ts_files:
-                safe_name = ts.name.replace("'", "'\\''")
-                f.write(f"file '{safe_name}'\n")
-
-        # 执行 FFmpeg 合并
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-loglevel",
-            "error",  # 只输出错误，减少日志体积
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            str(list_file),
-            "-c",
-            "copy",
-            str(output_file),
-        ]
-        print(f"{output_name} 开始合并")
-        result = subprocess.run(
-            cmd,
-            cwd=ts_dir,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        if result.stderr and len(result.stderr) > 10000:
-            result_stderr = result.stderr[:10000] + "\n...truncated..."
+        if encrypted_m3u8:
+            print(f"{output_name} 检测到 AES-128 key，使用 m3u8 解密合并")
+            result = merge_encrypted_m3u8(encrypted_m3u8, output_file)
         else:
-            result_stderr = result.stderr
+            print(f"{output_name} 开始合并")
+            result = merge_plain_ts(ts_dir, ts_files, output_file)
+
+        result_stderr = get_ffmpeg_stderr(result.stderr)
         if result.returncode == 0:
             if error_log.exists():
                 error_log.unlink(missing_ok=True)
@@ -212,7 +295,7 @@ def process_folder(folder: Path):
             if "No space left on device" in result.stderr:
                 STOP_EVENT.set()
                 return ("fail", folder_name, "❌ 磁盘爆满")
-            with open(error_log, "w") as f:
+            with open(error_log, "w", encoding="utf-8") as f:
                 f.write(result_stderr)
             return ("fail", folder_name, "FFmpeg 报错")
 
@@ -225,9 +308,6 @@ def process_folder(folder: Path):
 
         return ("fail", folder_name, f"异常: {e}")
     finally:
-        if list_file and list_file.exists():
-            list_file.unlink(missing_ok=True)
-
         checkDiskSpace()
 
 
@@ -243,13 +323,7 @@ def main():
     if not OUTPUT_DIR.exists():
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     print(f"~~~~~ 🎉 还能下{getFreeGB()}个G的 ~~~~~")
-    # 它会检查文件夹名里是否包含 "index" 或者 "m3u8"。
-    # 只要命中其中一个关键词，这个文件夹就会被加入到 target_folders 列表中。
-    target_folders = [
-        p
-        for p in BASE_DIR.iterdir()
-        if p.is_dir() and any(k in p.name.lower() for k in ["index", "m3u8"])
-    ]
+    target_folders = find_target_folders()
     print(f"🎬 发现任务: {len(target_folders)} 个\n")
 
     if len(target_folders) <= 0:
