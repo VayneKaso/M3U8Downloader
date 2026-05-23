@@ -99,20 +99,24 @@ def find_best_ts_dir(folder: Path) -> Path:
 
 
 def has_merge_inputs(folder: Path) -> bool:
+    # 判断一个一级任务目录里是否有可合并的素材。
+    # 例如：目录名不含 index/m3u8，但里面有 index.m3u8 或若干 .ts，也应该被扫描到。
     return any(folder.glob("*.m3u8")) or any(folder.rglob("*.ts"))
 
 
 def find_target_folders() -> list[Path]:
-    """Find first-level task folders that look like downloaded M3U8 jobs."""
+    """找出 BASE_DIR 下看起来像 M3U8 下载任务的一级目录。"""
     return [
         p
         for p in BASE_DIR.iterdir()
         if p.is_dir()
+        # 目录名命中时直接加入；否则再看目录内部是否存在 m3u8/ts 素材。
         and (any(k in p.name.lower() for k in ["index", "m3u8"]) or has_merge_inputs(p))
     ]
 
 
 def read_text_safely(path: Path) -> str:
+    # 常见 m3u8 是 UTF-8；少数下载工具会带 BOM 或混入异常字符，所以这里做一次兜底读取。
     try:
         return path.read_text(encoding="utf-8")
     except UnicodeDecodeError:
@@ -120,16 +124,20 @@ def read_text_safely(path: Path) -> str:
 
 
 def is_encrypted_m3u8(path: Path) -> bool:
+    # HLS 标准加密通常会写 EXT-X-KEY；当前只识别最常见的 AES-128。
     text = read_text_safely(path)
     return "#EXT-X-KEY" in text and "METHOD=AES-128" in text.upper()
 
 
 def find_encrypted_m3u8(folder: Path, ts_dir: Path) -> Path | None:
+    # 优先检查任务根目录和 TS 目录下的 m3u8，再递归兜底。
+    # 你的样例是：xxx.m3u8/index.m3u8 + xxx.m3u8/index/0.key + xxx.m3u8/index/0.ts。
     candidates = []
     candidates.extend(folder.glob("*.m3u8"))
     candidates.extend(ts_dir.glob("*.m3u8"))
     candidates.extend(folder.rglob("*.m3u8"))
 
+    # folder 和 ts_dir 可能相同，去重可以避免重复读取同一个 playlist。
     seen = set()
     for playlist in candidates:
         if playlist in seen:
@@ -150,14 +158,17 @@ def get_dir_size_gb(folder: Path) -> float:
 
 
 def get_ffmpeg_stderr(stderr: str) -> str:
+    # ffmpeg 报错有时非常长，错误日志截断到前 10000 个字符，避免生成超大 txt。
     if stderr and len(stderr) > 10000:
         return stderr[:10000] + "\n...truncated..."
     return stderr
 
 
 def merge_plain_ts(ts_dir: Path, ts_files: list[Path], output_file: Path) -> subprocess.CompletedProcess:
+    # 未加密 TS 保留原来的 concat 合并方式，速度快，也不会重新编码。
     list_file = ts_dir / "concat_list.txt"
     try:
+        # concat demuxer 需要一个文本清单，每行指向一个本地 TS 分片。
         with open(list_file, "w", encoding="utf-8") as f:
             for ts in ts_files:
                 safe_name = ts.name.replace("'", "'\\''")
@@ -186,18 +197,22 @@ def merge_plain_ts(ts_dir: Path, ts_files: list[Path], output_file: Path) -> sub
             text=True,
         )
     finally:
+        # 清单文件只是临时输入，合并结束后无论成功失败都清掉。
         if list_file.exists():
             list_file.unlink(missing_ok=True)
 
 
 def merge_encrypted_m3u8(playlist: Path, output_file: Path) -> subprocess.CompletedProcess:
+    # 加密 HLS 交给 ffmpeg 按 m3u8 规则处理，这样 key URI、IV、分片顺序都由 ffmpeg 解析。
     cmd = [
         "ffmpeg",
         "-y",
         "-loglevel",
         "error",
+        # 下载到本地的 key/ts 可能没有标准扩展名限制，ALL 可以避免被 ffmpeg 拒绝读取。
         "-allowed_extensions",
         "ALL",
+        # AES-128 HLS 会用 file 读取 m3u8/key/ts，用 crypto 解密本地分片。
         "-protocol_whitelist",
         "file,crypto,data",
         "-i",
@@ -244,6 +259,7 @@ def process_folder(folder: Path):
         print(f"{output_name} 扫描完毕，准备校验")
         # 检查ts是否合格。tag是一个标签，区分ts合成的种类，如果不合格，会抛出异常，这个任务算失败了。
         tag = TSAnalyzer.analyze(ts_files)
+        # 如果任务里存在 AES-128 m3u8，就在输出名里加 aes，便于区分普通合并结果。
         encrypted_m3u8 = find_encrypted_m3u8(folder, ts_dir)
         if encrypted_m3u8:
             tag = f"{tag}_aes"
@@ -276,9 +292,11 @@ def process_folder(folder: Path):
             )
 
         if encrypted_m3u8:
+            # 加密任务必须从 m3u8 入口合并，否则直接 concat 加密 TS 会得到不可播放文件。
             print(f"{output_name} 检测到 AES-128 key，使用 m3u8 解密合并")
             result = merge_encrypted_m3u8(encrypted_m3u8, output_file)
         else:
+            # 普通任务继续按 TS 文件名自然排序后 concat。
             print(f"{output_name} 开始合并")
             result = merge_plain_ts(ts_dir, ts_files, output_file)
 
