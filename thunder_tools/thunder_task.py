@@ -7,13 +7,25 @@ import json
 import re
 import subprocess
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 from urllib.request import Request, urlopen
 
 INVALID_FILENAME_CHARS = r'\/:*?"<>|'
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_HTML_PATH = PROJECT_ROOT / "thunder_tools" / "thunder_task.html"
 DEFAULT_DOWNLOAD_DIR = "output/3"
+TITLE_SEPARATOR = "-"
+TITLE_ALLOWED_PATTERN = re.compile(r"[\u4e00-\u9fffA-Za-z0-9,，.。!！?？]+")
+SUSPECT_SITE_WORD_PATTERN = re.compile(
+    r"[A-Za-z0-9\u4e00-\u9fff]*(?:仓库|官网|网址|网站|发布页|最新地址|永久地址|导航|收藏)[A-Za-z0-9\u4e00-\u9fff]*",
+    re.IGNORECASE,
+)
+EMAIL_PATTERN = re.compile(r"[A-Za-z0-9._%+-]+@\S*", re.IGNORECASE)
+QQ_PATTERN = re.compile(r"(?:QQ|企鹅|扣扣)\s*[:：]?\s*\d{5,12}", re.IGNORECASE)
+URL_PATTERN = re.compile(
+    r"(?:https?://|www\.)\S+|[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+\S*",
+    re.IGNORECASE,
+)
 ABSOLUTE_M3U8_PATTERN = re.compile(
     r"""(?P<url>(?:https?:)?//[^"'<>\s]+?\.m3u8(?:\?[^"'<>\s]*)?)""", re.IGNORECASE
 )
@@ -36,12 +48,37 @@ def sanitize_filename(value):
     return cleaned or "未命名视频"
 
 
+def sanitize_title(value):
+    """把网页标题清洗成更适合当下载目录名的短标题。"""
+    # 先做 HTML 标签清理和实体还原，避免 &amp; 或标签残留参与后续判断。
+    cleaned = html.unescape(strip_tags(value)).strip()
+    # 邮箱通常是资源站推广信息，先整体移除，避免 @ 和点号被当作普通符号保留下来。
+    cleaned = EMAIL_PATTERN.sub(" ", cleaned)
+    # QQ 联系方式通常也是推广信息，只清理带 QQ 语义的数字，避免误删标题里的普通数字。
+    cleaned = QQ_PATTERN.sub(" ", cleaned)
+    # URL 或裸域名大概率是网站信息，先清掉，避免后续特殊符号替换产生很多分隔符。
+    cleaned = URL_PATTERN.sub(" ", cleaned)
+    # 带“仓库/官网/发布页”等词的片段多数是来源站广告，按片段移除。
+    cleaned = SUSPECT_SITE_WORD_PATTERN.sub(" ", cleaned)
+
+    # 非允许字符统一替换成分隔符；空格不保留，因为它不适合做稳定的目录名。
+    parts = TITLE_ALLOWED_PATTERN.findall(cleaned)
+    # 用 / 连接被合法片段隔开的内容，相当于 Java 里 split 后再 join。
+    cleaned = TITLE_SEPARATOR.join(part for part in parts if part)
+    # 连续分隔符压成一个，避免多个特殊符号产生空目录层级。
+    cleaned = re.sub(rf"{re.escape(TITLE_SEPARATOR)}+", TITLE_SEPARATOR, cleaned)
+    # 去掉首尾分隔符和点号，避免生成空目录或奇怪的尾部文件名。
+    cleaned = cleaned.strip(f"{TITLE_SEPARATOR}.。 ")
+    # 如果标题被清空，仍然给一个兜底值，避免迅雷任务没有名字。
+    return cleaned or "未命名视频"
+
+
 def guess_source_name(url):
     """从 m3u8 地址里取最后一段文件名，通常是 index.m3u8。"""
     # urlparse 类似 Java URI，可以把 URL 拆成 path/query 等结构化字段。
     parsed = urlparse(url)
     # Path(...).name 只取路径最后一段，避免手写 split 时漏掉边界情况。
-    name = Path(parsed.path).name
+    name = unquote(Path(parsed.path).name)
     # 如果 URL 没有文件名，就沿用 m3u8 场景下最常见的 index.m3u8。
     return name or "index.m3u8"
 
@@ -107,7 +144,7 @@ def extract_title(page_text):
         )
     # 找到 og:title 就直接清理并返回。
     if meta_match:
-        return sanitize_filename(html.unescape(strip_tags(meta_match.group(1))))
+        return sanitize_title(meta_match.group(1))
     # 兜底读取浏览器标签页标题。
     title_match = re.search(
         r"<title[^>]*>(.*?)</title>", page_text, re.IGNORECASE | re.DOTALL
@@ -116,7 +153,7 @@ def extract_title(page_text):
     if not title_match:
         return None
     # title 标签可能跨行，所以先去标签再压缩空白。
-    return sanitize_filename(html.unescape(strip_tags(title_match.group(1))))
+    return sanitize_title(title_match.group(1))
 
 
 def extract_m3u8_url(page_url, page_text):
@@ -163,12 +200,15 @@ def build_download_name(title, url, explicit_name=None):
     # 如果用户直接指定完整文件名，就尊重用户输入，只做非法字符清理。
     if explicit_name:
         return sanitize_filename(explicit_name)
-    # 标题只作为前缀，保留原始 URL 的 index.m3u8 这类后缀，贴合迅雷当前识别习惯。
-    safe_title = sanitize_filename(title)
+    # 标题只作为目录前缀，保留原始 URL 的 index.m3u8 这类后缀，贴合迅雷当前识别习惯。
+    safe_title = sanitize_title(title)
     # 保留原始 m3u8 文件名，方便看到它仍然是一个 m3u8 下载任务。
     source_name = sanitize_filename(guess_source_name(url))
-    # 和你验证成功的“我的标题index.m3u8”保持一致，不额外加分隔符。
-    return f"{safe_title}{source_name}"
+    # 强制保留 .m3u8 后缀，避免资源站 URL 文件名异常时迅雷不按 m3u8 任务识别。
+    if not source_name.lower().endswith(".m3u8"):
+        source_name = f"{source_name}.m3u8"
+    # 用 / 把标题目录和 m3u8 文件名隔开，迅雷下载后会形成“标题/xxx.m3u8”的结构。
+    return f"{safe_title}{TITLE_SEPARATOR}{source_name}"
 
 
 def build_html(url, download_name, download_dir):
