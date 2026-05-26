@@ -77,7 +77,7 @@ class TSAnalyzer:
         # 5️⃣ 连续性判断（核心规则）
         if count == (max_idx - min_idx + 1):
             return f"full_{min_idx}_{max_idx}"
-
+        # 只要是连续的，我就认为
         return "sub"
 
 
