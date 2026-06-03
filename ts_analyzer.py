@@ -17,8 +17,13 @@ class TSAnalyzer:
 
         可能抛异常:
         - ValueError: 文件结构异常
-        """
 
+        info:
+        目的是: 当前目录下的ts可能会是0.ts 1.ts 2.ts 也可能是seg-1-part.ts.... 这个就是根据ts集合，粗略的判断一下ts文件是否合法
+        怎么算合法？只要连续就算合法。比如0.ts-100.ts 2.ts - 102.ts count 都等于 101,能对的上就算合法。
+        反之如果不全的，则认为是sub，也能通过但是会在名字上做出区分，有些sub可能是我人为造成的，删除中间的广告，有些则是可能没下载全。
+        所以出现sub 的信息需要让人看到，以便分析具体原因
+        """
         if not ts_files:
             return "sub"
 
@@ -77,7 +82,7 @@ class TSAnalyzer:
         # 5️⃣ 连续性判断（核心规则）
         if count == (max_idx - min_idx + 1):
             return f"full_{min_idx}_{max_idx}"
-        # 只要是连续的，我就认为
+        # 只要是连续的，我就认为是完整的
         return "sub"
 
 

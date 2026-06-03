@@ -32,6 +32,13 @@ ABSOLUTE_M3U8_PATTERN = re.compile(
 RELATIVE_M3U8_PATTERN = re.compile(
     r"""["'](?P<url>[^"']+?\.m3u8(?:\?[^"']*)?)["']""", re.IGNORECASE
 )
+QUALITY_HEIGHT_PATTERN = re.compile(
+    r"(?<!\d)(\d{3,4})\s*p(?![A-Za-z])", re.IGNORECASE
+)
+QUALITY_SIZE_PATTERN = re.compile(r"(?<!\d)(\d{3,4})\s*[xX]\s*(\d{3,4})(?!\d)")
+QUALITY_RATE_PATTERN = re.compile(
+    r"(?<!\d)(\d+(?:\.\d+)?)\s*([kKmM])(?:bps|b|_|-|/|\b)"
+)
 
 
 def sanitize_filename(value):
@@ -121,6 +128,52 @@ def normalize_page_text(page_text):
     return normalized.replace("\\u0026", "&")
 
 
+def normalize_m3u8_candidate(page_url, candidate):
+    """把页面里提取到的 m3u8 片段统一转成绝对 URL。"""
+    # 去掉 JS 语法或标点带来的尾巴，避免交给迅雷的是脏链接。
+    cleaned = candidate.rstrip("\\),.;")
+    # 协议相对地址 //cdn.xxx/index.m3u8 要继承当前页面的协议。
+    if cleaned.startswith("//"):
+        return f"{urlparse(page_url).scheme}:{cleaned}"
+    # 普通相对地址用 urljoin 补全，效果类似 Java URI.resolve。
+    return urljoin(page_url, cleaned)
+
+
+def extract_quality_score(url):
+    """从 URL 中提取清晰度分数，优先比较分辨率，再比较码率。"""
+    # URL 里可能有中文或转义字符，先解码再匹配 1080P / 720p / 1920x1080 等信息。
+    readable_url = unquote(url)
+    # 分辨率高度越大，通常清晰度越高。
+    heights = [
+        int(match.group(1)) for match in QUALITY_HEIGHT_PATTERN.finditer(readable_url)
+    ]
+    # 有些站点不用 1080p，而是写 1920x1080，这里取后面的高度。
+    heights.extend(
+        int(match.group(2)) for match in QUALITY_SIZE_PATTERN.finditer(readable_url)
+    )
+    # 码率越大，通常画质越好；只有分辨率相同或缺失时才作为第二排序依据。
+    rates = []
+    for match in QUALITY_RATE_PATTERN.finditer(readable_url):
+        # K 按 1 倍算，M 按 1000 倍算，方便不同单位放在同一尺度比较。
+        multiplier = 1000 if match.group(2).lower() == "m" else 1
+        rates.append(int(float(match.group(1)) * multiplier))
+    # 没有清晰度信息时给 0，后续排序会保持第一个候选优先。
+    return (max(heights, default=0), max(rates, default=0))
+
+
+def pick_best_m3u8_url(candidates):
+    """从多个 m3u8 候选里选择 URL 看起来最高清晰度的版本。"""
+    # 带上 index 是为了同分时保留网页原始顺序，避免排序导致行为随机。
+    indexed_candidates = list(enumerate(candidates))
+    # max 会优先比较清晰度分数，分数相同时用 -index 让更早出现的候选胜出。
+    _, best_url = max(
+        indexed_candidates,
+        key=lambda item: (*extract_quality_score(item[1]), -item[0]),
+    )
+    # 返回最终要交给迅雷的 m3u8 地址。
+    return best_url
+
+
 def strip_tags(value):
     """去掉标题里可能混进来的 HTML 标签。"""
     # 标题通常来自 meta 或 title，简单标签清理已经足够。
@@ -157,24 +210,36 @@ def extract_title(page_text):
 
 
 def extract_m3u8_url(page_url, page_text):
-    """从网页 HTML 里提取第一个 m3u8 地址。"""
+    """从网页 HTML 里提取清晰度最高的 m3u8 地址。"""
     # 先还原常见转义，再用统一正则查找 m3u8。
     normalized = normalize_page_text(page_text)
+    # 用列表保存所有候选，后面统一按 URL 里的清晰度信息做选择。
+    candidates = []
+    # 记录已加入的 URL，避免同一个地址在脚本和展示文本里重复出现。
+    seen = set()
+
     # 优先找绝对地址，避免把页面展示文字里的“文件名xxx.m3u8”误当成链接。
     for match in ABSOLUTE_M3U8_PATTERN.finditer(normalized):
-        # 去掉末尾可能跟着的转义或标点，避免把 JS 语法带进 URL。
-        candidate = match.group("url").rstrip("\\),.;")
-        # 协议相对地址 //cdn.xxx/index.m3u8 要继承页面协议。
-        if candidate.startswith("//"):
-            return f"{urlparse(page_url).scheme}:{candidate}"
-        # 绝对地址可以直接返回。
-        return candidate
+        # 统一成绝对 URL，后面排序时只处理一种格式。
+        candidate = normalize_m3u8_candidate(page_url, match.group("url"))
+        # 去重后再加入候选列表。
+        if candidate not in seen:
+            candidates.append(candidate)
+            seen.add(candidate)
+
     # 找不到绝对地址时，再尝试引号包裹的相对地址。
     for match in RELATIVE_M3U8_PATTERN.finditer(normalized):
-        # 只从引号内取值，避免把中文说明文字拼进链接。
-        candidate = match.group("url").rstrip("\\),.;")
-        # 相对地址用 urljoin 变成绝对地址，类似 Java URI.resolve。
-        return urljoin(page_url, candidate)
+        # 只从引号内取值，并统一成绝对 URL。
+        candidate = normalize_m3u8_candidate(page_url, match.group("url"))
+        # 去重后再加入候选列表。
+        if candidate not in seen:
+            candidates.append(candidate)
+            seen.add(candidate)
+
+    # 找到多个候选时，优先选择 URL 里清晰度最高的那个。
+    if candidates:
+        return pick_best_m3u8_url(candidates)
+
     # 找不到就明确抛错，避免生成一个空任务让迅雷弹出奇怪结果。
     raise ValueError("没有在网页里找到 .m3u8 地址")
 

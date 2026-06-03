@@ -8,7 +8,11 @@ from ffmpeg_utils import get_ffmpeg_stderr
 from handlers import pick_handler
 from logcat import LOGCAT
 from mp4_validator import get_validator
-from output_namer import build_unique_output_paths, get_clean_name
+from output_namer import (
+    build_unique_output_paths,
+    find_existing_valid_output,
+    get_clean_name,
+)
 from task_scanner import (
     find_best_ts_dir,
     find_target_folders,
@@ -54,7 +58,9 @@ def disk_monitor():
         # 软限制检查 (3GB)
         if not is_disk_space_sufficient(DISK_SAFE_SPACE_GB):
             if not SOFT_STOP_FLAG.is_set():
-                LOGCAT.log(f"\n⚠️ 提示：磁盘空间低于 {DISK_SAFE_SPACE_GB}GB，将不再启动新任务。")
+                LOGCAT.log(
+                    f"\n⚠️ 提示：磁盘空间低于 {DISK_SAFE_SPACE_GB}GB，将不再启动新任务。"
+                )
                 SOFT_STOP_FLAG.set()
         else:
             SOFT_STOP_FLAG.clear()
@@ -93,31 +99,29 @@ def process_folder(folder: Path):
 
         # 2. 基础信息生成
         clean_name = get_clean_name(folder_name)
-        output_name = f"{clean_name}.mp4"
-        output_file = OUTPUT_DIR / output_name
-        error_log = OUTPUT_DIR / f"{clean_name}.txt"
 
-        LOGCAT.log(f"{output_name} 扫描完毕，准备校验")
-        # 检查ts是否合格。tag是一个标签，区分ts合成的种类，如果不合格，会抛出异常，这个任务算失败了。
+        LOGCAT.log(f"{folder_name} 扫描完毕，准备校验")
+
+        # 检查ts文件集合是否合格。返回一个tag 例如:full_x_y ,tag是一个标签，区分ts集合状态
         tag = TSAnalyzer.analyze(ts_files)
         # 根据当前任务目录选择具体网站处理器，类似 Java 里从 List<SiteHandler> 里挑一个实现类。
         handler = pick_handler(folder, ts_dir)
         # 处理器可以按自己的网站特征调整输出标签，例如 AES 任务会追加 aes。
         tag = handler.build_tag(tag)
         # 拼出带 6 位内容指纹的输出路径，避免两个同名视频因为文件名相同而被误判为已存在。
-        output_name, output_file, error_log = build_unique_output_paths(
+        output_name, output_file, error_log, content_suffix = build_unique_output_paths(
             OUTPUT_DIR, folder, clean_name, tag, ts_files
         )
 
         LOGCAT.log(f"{output_name} 校验合格，准备合并")
 
         # 3. 跳过本地已有的
-        if output_file.exists():
-            is_ok, _ = get_validator().verify(output_file)
-            if is_ok:
-                return ("skip", folder_name, f"已存在且完整 ({output_name})")
-            else:
-                output_file.unlink()
+        existing_file = find_existing_valid_output(
+            output_file, content_suffix, get_validator()
+        )
+        if existing_file is not None:
+            # 同名或同 6 位内容标识的视频只要完整，就认为这个任务已经处理过。
+            return ("skip", folder_name, f"已存在且完整 ({existing_file.name})")
 
         # 二次检查停止信号
         if STOP_EVENT.is_set():
@@ -185,10 +189,6 @@ def main():
         LOGCAT.log("👋🏻 👋🏻  没有可执行的任务，程序退出")
         return
 
-    # if len(target_folders) >= 0:
-    #     LOGCAT.log("👋🏻 👋🏻  没有可执行的任务，程序退出")
-    #     return
-
     # 启动监控
     monitor_thread = threading.Thread(target=disk_monitor, daemon=True)
     monitor_thread.start()
@@ -213,6 +213,8 @@ def main():
                     if status == "success"
                     else "⏩ 跳过"
                     if status == "skip"
+                    else "⚠️ 警告"
+                    if status == "warn"
                     else "❌ 失败"
                 )
                 LOGCAT.log(f"{tag}  name: {name}  info: {info}")

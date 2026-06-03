@@ -3,14 +3,15 @@
 
 import sys
 
-# import pyperclip
+import pyperclip
+
 from thunder_tools.thunder_task import main
 
 #################################################################################################################################
 # 在 VS Code 里点“运行 Python 文件”时，可以把网页 URL 填在这里。
 # 默认留空，避免提交后误触发固定网页地址。
-URL = "https://hsck123.25img.com/view/?id=elk3gx8n"
-# URL = pyperclip.paste()
+# URL = "https://91porny.com/video/view/679967df6ba4fc760a1c"
+URL = pyperclip.paste()
 #################################################################################################################################
 
 if __name__ == "__main__":
